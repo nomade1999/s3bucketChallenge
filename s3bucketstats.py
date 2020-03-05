@@ -29,7 +29,7 @@ except Exception as e:
     print("Exception on s3 instantiation ", e)
 
 groups_dict = {'REDUCED_REDUNDANCY', 'STANDARD', 'STANDARD_IA'}
-size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+size_name = ("B", "KB", "MB", "GB", "TB", "PB")
 csv_columns = ['Bucket', 'Key', 'ETag', 'Size', 'LastModified', 'StorageClass']
 
 
@@ -250,12 +250,12 @@ def load_manifest(bucket_name, key):
 
 
 def load_inventory_csv(bucket_name, inventory_ids):
-    inv = []
+    inv_agg = []
     for inventory in inventory_ids:
         if inventory['Format'] == "CSV" and inventory['IsEnabled']:
             try:
                 if settings._VERBOSE > 0:
-                    print("Using Inventory Id '{}' for bucket '{}'".format(inventory['Id'], bucket_name))
+                    print("Using Inventory Id '{}' for bucket '{}'".format(inventory['Id'], bucket_name), end="\r")
                 inventory_manifest = find_latest_inventory_manifest_key(bucket_name, inventory['Bucket'],
                                                                         inventory['Id'])
                 if inventory_manifest.__len__() == 0:
@@ -269,26 +269,25 @@ def load_inventory_csv(bucket_name, inventory_ids):
                     print("files: {}".format(manifest['files'][0]['key']))
 
                 if settings._S3SELECT:
-                    inv = pd.concat(
-                        s3select_inventory_csv(inventory['Bucket'], files['key'], schema).groupby('StorageClass').agg(
+                    inv_agg = pd.concat(
+                        s3select_inventory_csv(inventory['Bucket'], files['key'], schema).groupby('StorageClass',
+                                                                                                  as_index=False).agg(
                             {'Count': 'sum', 'Size': 'sum', 'LastModifiedDate': 'max'}) for files in
-                        manifest['files']).groupby('StorageClass').agg(
-                        {'Count': 'sum', 'Size': 'max', 'LastModifiedDate': 'max'}).rename(
-                        columns={'LastModifiedDate': 'LastModified'})
+                        manifest['files']).groupby('StorageClass', as_index=False).agg(
+                        {'Count': 'sum', 'Size': 'max', 'LastModifiedDate': 'max'})
                 else:
-                    inv = pd.concat(
-                        read_inventory_file(inventory['Bucket'], files['key'], schema).groupby('StorageClass').agg(
+                    inv_agg = pd.concat(
+                        read_inventory_file(inventory['Bucket'], files['key'], schema).groupby('StorageClass',
+                                                                                               as_index=False).agg(
                             {'Count': 'sum', 'Size': 'sum', 'LastModifiedDate': 'max'}) for files in
-                        manifest['files']).groupby(
-                        'StorageClass').agg({'Count': 'sum', 'Size': 'max', 'LastModifiedDate': 'max'}).rename(
-                        columns={'LastModifiedDate': 'LastModified'})
-
+                        manifest['files']).groupby('StorageClass', as_index=False).agg(
+                        {'Count': 'sum', 'Size': 'max', 'LastModifiedDate': 'max'})
+                break
             except Exception as e:
                 print("load_inventory exception:", e)
                 continue
-            if inv.__len__() > 0:
-                break
-    return inv
+    #    inv_agg.rename(columns={'LastModifiedDate': 'LastModified'})
+    return inv_agg
 
 
 def display_size(size_bytes, sizeformat=-1):
@@ -325,7 +324,11 @@ Analyse from compressed CSV file in the bucket via S3 Select
 def s3select_inventory_csv(bucket_name, key, cols_names):
     content_options = {"FieldDelimiter": ",", 'AllowQuotedRecordDelimiter': False}
     # expression = "select * from s3object"
-    expression = "select _6,_7,_8,_9 from s3object"
+    size_pos = cols_names.index('Size')
+    lastmodified_pos = cols_names.index('LastModifiedDate')
+    storage_pos = cols_names.index('StorageClass')
+    encryption_pos = cols_names.index('EncryptionStatus')
+    expression = "select _{},_{},_{},_{} from s3object".format(size_pos+1,lastmodified_pos+1,storage_pos+1,encryption_pos+1)
     req = s3.select_object_content(
         Bucket=bucket_name,
         Key=key,
@@ -341,11 +344,14 @@ def s3select_inventory_csv(bucket_name, key, cols_names):
         elif "Stats" in event:
             stats = event['Stats']['Details']
     file_str = "".join(r for r in records)
-
+    if settings._VERBOSE > 2:
+        print("s3select strlen: {}  records:{}".format(file_str.__len__(), records.__len__()))
     df = pd.read_csv(StringIO(file_str), names=['Size', 'LastModifiedDate', 'StorageClass', 'EncryptionStatus'])
 
     aggr = df.groupby('StorageClass').agg({'StorageClass': 'count', 'Size': 'sum', 'LastModifiedDate': 'max'}).rename(
         columns={'StorageClass': 'Count'}).reset_index()
+    if settings._VERBOSE > 4:
+        print(">>>>",aggr)
     return aggr
 
 
@@ -389,6 +395,25 @@ def add_bool_arg(parser, name, default=False, description=""):
     parser.set_defaults(**{name: default})
 
 
+def get_bucket_cost_for_storageclass(bucket_region, storageClass, storageSize):
+    objects_size = storageSize / math.pow(1024, 3)
+    pricing = get_priceDimensions_for_region_volume(bucket_region, storageClass)
+    cost = 0
+    while objects_size > 0:
+        for x in pricing:
+            if x["endRange"] == "Inf":
+                endRange = sys.maxsize
+            else:
+                endRange = int(x["endRange"])
+            if objects_size < endRange:
+                pricePerUnit = x['pricePerUnit']['USD']
+                cost += (float(objects_size) * float(pricePerUnit))
+                return cost
+            else:
+                objects_size -= endRange
+    return -1
+
+
 def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=""):
     aggs = []
     if settings._CACHE and os.path.isfile(bucket_name + ".cache"):
@@ -397,12 +422,12 @@ def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=
     elif settings._INVENTORY:
         inventory = get_inventory_configurations(bucket_name)
         if inventory != "Disabled" and inventory.__len__() > 0:
-            print("Processing via Inventory for bucket {}".format(bucket_name), end="")
+            print("Processing via Inventory for bucket {}".format(bucket_name), end="\r")
             aggs = load_inventory_csv(bucket_name, inventory)
 
     if aggs.__len__() == 0:
         # at this point we could not find any data from the cache or inventory and we have to revert to listing all objects from the bucket
-        print("Processing via ListObjects for bucket {}".format(bucket_name), end="")
+        print("Processing via ListObjects for bucket {}".format(bucket_name), end="\r")
         prefix = prefix[1:] if prefix.startswith(delimiter) else prefix
         start_after = (start_after or prefix) if prefix.endswith(delimiter) else start_after
         s3_paginator = s3.get_paginator("list_objects_v2")
@@ -439,10 +464,25 @@ def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=
 
     bucket_objects = aggs['Count'].sum()
     bucket_size = aggs['Size'].sum()
-    bucket_last = aggs['LastModified'].max()
+    if 'LastModified' in aggs:
+        bucket_last = aggs['LastModified'].max()
+    else:
+        bucket_last = aggs['LastModifiedDate'].max()
 
+    bucket_cost = 0.0
     bucket = boto3.resource("s3").Bucket(bucket_name)
+    bucket_region = get_region(bucket_name)
+    content = aggs.to_dict('rows')
+    for storageClass in content:
+        cost = get_bucket_cost_for_storageclass(bucket_region, storageClass['StorageClass'], storageClass['Size'])
+        if cost > 0:
+            storageClass['Cost'] = "${:,.2f}".format(cost)
+            bucket_cost += cost
 
+    if bucket_cost > 0:
+        bucket_cost = "${:,.2f}".format(bucket_cost)
+    else:
+        bucket_cost = "n/a"
     bucket_stats = [
         {
             'Name': bucket_name,
@@ -456,16 +496,101 @@ def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=
             'Policy': get_policy(bucket_name),
             'ObjectLock': get_object_lock_configuration(bucket_name),
             'Inventory': get_inventory_configurations(bucket_name),
-            'Region': get_region(bucket_name),
+            'Region': bucket_region,
             'LocationConstraint': get_location(bucket_name),
             'Grantee': get_grantees(bucket_name),
             'Encryption': get_encryption(bucket_name),
             'Size': display_size(bucket_size),
             'Count': bucket_objects,
-            'Content': aggs.to_dict('rows')
+            'Cost': bucket_cost,
+            'Content': content
         }
     ]
     yield bucket_stats
+
+
+def load_aws_pricing(region, vol):
+    pricing = boto3.client('pricing', "us-east-1")
+    prefix = "/"
+    delimiter = "/"
+    start_after = ""
+    prefix = prefix[1:] if prefix.startswith(delimiter) else prefix
+    start_after = (start_after or prefix) if prefix.endswith(delimiter) else start_after
+    loc = describe_region(region)
+    try:
+        pricing_page = pricing.get_paginator("get_products")
+        for p in pricing_page.paginate(ServiceCode='AmazonS3',
+                                       Filters=[
+                                           {'Type': 'TERM_MATCH', 'Field': 'location', 'Value': loc},
+                                           # {'Type': 'TERM_MATCH', 'Field': 'servicename', 'Value': 'Amazon Simple Storage Service'},
+                                           # {'Type': 'TERM_MATCH', 'Field': 'usagetype', 'Value': 'TimedStorage-ByteHrs'}
+                                           # {'Type': 'TERM_MATCH', 'Field': 'volumeType', 'Value': 'Standard - Infrequent Access'}
+                                           # {'Type': 'TERM_MATCH', 'Field': 'volumeType', 'Value': 'Standard'}
+                                           {'Type': 'TERM_MATCH', 'Field': 'volumeType', 'Value': vol}
+                                       ],
+                                       PaginationConfig={'PageSize': 100}):
+            x = p.get('PriceList')
+            y = p.get('PriceList')[0]
+
+            return json.loads(p.get('PriceList')[0])
+    except Exception as e:
+        print("EXCEPTION in get_products(region={},vol={}, loc={})".format(region,vol,loc), e)
+    return {'terms': {'OnDemand': []}}
+
+
+def describe_region(region_id):
+    # First try via API, this would allow to pickup on new regions as they arise but does requires more permissions.
+    try:
+        # ec2 = boto3.client("ec2")
+        # ec2_responses = ec2.describe_regions()
+        ssm_client = boto3.client('ssm')
+        tmp = '/aws/service/global-infrastructure/regions/%s/longName' % region_id
+        ssm_response = ssm_client.get_parameter(Name=tmp)
+        region_name = ssm_response['Parameter']['Value']
+    except Exception:
+        regions = {
+            'eu-north-1': 'Europe (Stockholm)',
+            'ap-south-1': 'Asia Pacific (Mumbai)',
+            'eu-west-3': 'Europe (Paris)',
+            'eu-west-2': 'Europe (London)',
+            'eu-west-1': 'Europe (Ireland)',
+            'ap-northeast-2': 'Asia Pacific (Seoul)',
+            'ap-northeast-1': 'Asia Pacific (Tokyo)',
+            'sa-east-1': 'South America (Sao Paulo)',
+            'ca-central-1': 'Canada (Central)',
+            'ap-southeast-1': 'Asia Pacific (Singapore)',
+            'ap-southeast-2': 'Asia Pacific (Sydney)',
+            'eu-central-1': 'Europe (Frankfurt)',
+            'us-east-1': 'US East (N. Virginia)',
+            'us-east-2': 'US East (Ohio)',
+            'us-west-1': 'US West (N. California)',
+            'us-west-2': 'US West (Oregon)'
+        }
+        region_name = regions.get(region_id)
+    return region_name
+
+
+def get_priceDimensions_for_region_volume(region, volumeType):
+    volume_types = {
+        "STANDARD": "Standard",
+        "STANDARD_IA": "Standard - Infrequent Access",
+        "ONEZONE_IA": "One Zone - Infrequent Access",
+        "REDUCED_REDUNDANCY": "Reduced Redundancy",
+        "GLACIER": "Amazon Glacier"
+    }
+    volumeTypeLong = volume_types.get(volumeType)
+    if volumeTypeLong is None:
+        print("Could not find entry for volumeType ", volumeType)
+        return []
+    price_list = load_aws_pricing(region, volumeTypeLong).get('terms')['OnDemand']
+    price_dimensions = []
+    if len(price_list) == 0:
+        return []
+    for k, v in price_list.items():
+        for a, b in v['priceDimensions'].items():
+            price_dimensions.append(b)
+
+    return sorted(price_dimensions, key=lambda i: int(i['beginRange']))
 
 
 if __name__ == "__main__":
@@ -515,8 +640,8 @@ if __name__ == "__main__":
         bucket_list.append(settings._BUCKET_LIST_REGEX)
 
     realstart = time.perf_counter()
-    print("{:60}{:>30}{:>20}{:>20}{:>30}{:>40}".format("Bucket", "Created", "Objects", "Size", "LastModified",
-                                                       "Processing Time"), file=sys.stderr)
+    print("{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format("Bucket", "Created", "Objects", "Size", "LastModified",
+                                                             "Cost (USD)", "Processing Time"), file=sys.stderr)
 
     for bucket_name in bucket_list:
         try:
@@ -535,14 +660,20 @@ if __name__ == "__main__":
         bucket_creation = boto3.resource("s3").Bucket(bucket_name).creation_date
         start = time.perf_counter()
         for object in analyse_bucket_contents(bucket_name, settings._KEY_PREFIX):
-            print("{:60}{:>30}{:>20}{:>20}{:>30}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
-                                                         object[0]['Size'], object[0]['LastModified']), file=sys.stderr,
-                  end="\r")
+            print(
+                "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
+                                                             object[0]['Size'], object[0]['LastModified'],
+                                                             object[0]['Cost']), file=sys.stderr,
+                end="\r")
             buckets_stats_array.extend(object)
             print(
-                "{:60}{:>30}{:>20}{:>20}{:>30}{:>40}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
-                                                             object[0]['Size'], object[0]['LastModified'], str(
-                        timedelta(milliseconds=round(1000 * (time.perf_counter() - start))))), file=sys.stderr)
+                "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(bucket_name, object[0]['CreationDate'],
+                                                                   object[0]['Count'],
+                                                                   object[0]['Size'], object[0]['LastModified'],
+                                                                   object[0]["Cost"],
+                                                                   str(timedelta(milliseconds=round(
+                                                                       1000 * (time.perf_counter() - start))))),
+                file=sys.stderr)
             # print("{:>40} !".format(str(timedelta(milliseconds=round(1000 * (time.perf_counter() - start))))), file=sys.stderr)
             if settings._VERBOSE > 1:
                 print(object)
