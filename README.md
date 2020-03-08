@@ -37,14 +37,50 @@ If an inventory was already setup and enabled it will try to make use of it to r
 
 ### Prerequisites
 
-You will need to have python3 installed with the boto3 sdk. Most of the other import should be there by default
+You will need to have Python 3.x installed with the boto3 sdk. Most of the other import should be there by default
 
-On a clean linux server I had to first install python3 then boto3 and requests.
+On a clean linux server start by installing Python 3.x if you dont already have.
+You can check your intalled version as follow;
 ```
-yum install python3
-pip3 install boto3 requests pandas
+python -V
 ```
 
+Now make sure that you have your environment setup to access AWS correctly.
+If you have the AWS Cli installed you can test with a simple command as follow;
+```
+aws s3 ls
+```
+If you are using profiles you should be able to to set your environment with your default profile to use as follow;
+```
+set AWS_DEFAULT_PROFILE=myprofile
+```
+
+I personally like to use AWS SSO to access accounts as we can set ephemeral credentials
+```
+aws configure sso --profile sso
+SSO start URL [https://d-xxxxxx.awsapps.com/start]:
+SSO Region [us-east-1]:
+There are 7 AWS accounts available to you.
+Using the account ID ############
+There are 4 roles available to you.
+Using the role name "AWSReadOnlyAccess"
+CLI default client Region [ca-central-1]:
+CLI default output format [None]:
+CLI profile name [AWSReadOnlyAccess-############]: sso
+
+To use this profile, specify the profile name using --profile, as shown:
+
+aws s3 ls --profile sso
+set AWS_DEFAULT_PROFILE=sso
+aws s3 ls
+```
+
+If you have issues connecting ou can have a look at this page to help you
+```
+https://boto3.amazonaws.com/v1/documentation/api/latest/guide/configuration.html
+```
+
+Now install the script by cloning the repository
 ```
 git clone $REPO_URL && cd s3bucketsstats
 # if using virtualenv
@@ -121,11 +157,11 @@ Just setup your environement to connect to AWS and test it to make sure you have
 If running on an EC2 instance I would suggest to use IAM Role attached to your EC2 instance.
 ```
 usage: s3bucketstats.py [-h] [-v VERBOSE] [-l BUCKET_LIST] [-k KEY_PREFIX]
-                            [-r REGION_FILTER] [-o OUTPUT] [-s DISPLAY_SIZE]
-                            [-cache | -no-cache] [-refresh | -no-refresh]
-                            [-inventory | -no-inventory]
-                            [-s3select | -no-s3select]
-                            [-lowmemory | -no-lowmemory]
+                        [-r REGION_FILTER] [-o OUTPUT] [--size SIZE]
+                        [-cache | -no-cache] [-refresh | -no-refresh]
+                        [-inventory | -no-inventory]
+                        [-s3select | -no-s3select]
+                        [-lowmemory | -no-lowmemory]
 
 optional arguments:
   -h, --help        show this help message and exit
@@ -134,8 +170,8 @@ optional arguments:
   -k KEY_PREFIX     Key prefix to filter on, default='/'
   -r REGION_FILTER  Regex Region filter
   -o OUTPUT         Output to File
-  -s DISPLAY_SIZE   Display size in 0:B, 1:KB, 2:MB, 3:GB, 4:TB, 5:PB, 6:EB,
-                    7:ZB, 8:YB
+  --size SIZE       Possible values: [ B | KB | MB | GB | TB | PB | EB | ZB |
+                    YB ]
   -cache            Use Cache file if available
   -no-cache         Do not Use Cache file if available (DEFAULT)
   -refresh          Force Refresh Cache
