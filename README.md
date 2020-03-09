@@ -162,6 +162,7 @@ usage: s3bucketstats.py [-h] [-v VERBOSE] [-l BUCKET_LIST] [-k KEY_PREFIX]
                         [-inventory | -no-inventory]
                         [-s3select | -no-s3select]
                         [-lowmemory | -no-lowmemory]
+                        [-threaded | -no-threaded]
 
 optional arguments:
   -h, --help        show this help message and exit
@@ -182,6 +183,8 @@ optional arguments:
   -no-s3select      Do not Use S3 Select to parse inventory result files
   -lowmemory        If you have low memory.
   -no-lowmemory     Do not If you have low memory. (DEFAULT)
+  -threaded         Use Multi-Thread. (DEFAULT)
+  -no-threaded      Do not Use Multi-Thread. 
 
 ```
 You can then try the commandline as follow;

@@ -23,6 +23,8 @@ import pandas as pd
 import requests
 from botocore.config import Config
 
+from threading import Thread
+
 groups_dict = {'REDUCED_REDUNDANCY', 'STANDARD', 'STANDARD_IA'}
 sizes_name = ["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"]
 csv_columns = ['Bucket', 'Key', 'ETag', 'Size', 'LastModified', 'StorageClass']
@@ -45,6 +47,10 @@ class Settings(object):
         self._INVENTORY = None
         self._S3SELECT = None
         self._LOWMEMORY = False
+        self._THREADED = False
+
+    def set_threaded(self, value):
+        self._THREADED = value
 
     def set_lowmemory(self, value):
         self._LOWMEMORY = value
@@ -412,7 +418,136 @@ def get_bucket_cost_for_storageclass(bucket_region, storageClass, storageSize):
     return -1
 
 
-def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=""):
+def threaded_analyse_bucket_contents(bucket_name, result, i):
+    processing_start = time.perf_counter()
+
+    prefix = settings._KEY_PREFIX
+    delimiter = "/"
+    start_after = ""
+    aggs = []
+    if settings._CACHE and os.path.isfile(bucket_name + ".cache"):
+        print("Processing via local Cache for bucket {}".format(bucket_name), end="\r")
+        aggs = read_cache_csv(bucket_name)
+    elif settings._INVENTORY:
+        inventory = get_inventory_configurations(bucket_name)
+        if inventory != "Disabled" and inventory.__len__() > 0:
+            print("Processing via Inventory for bucket {}".format(bucket_name), end="\r")
+            aggs = load_inventory_csv(bucket_name, inventory)
+
+    if aggs.__len__() == 0:
+        # at this point we could not find any data from the cache or inventory and we have to revert to listing all objects from the bucket
+        print("Processing via ListObjects for bucket {}".format(bucket_name), end="\r")
+        prefix = prefix[1:] if prefix.startswith(delimiter) else prefix
+        start_after = (start_after or prefix) if prefix.endswith(delimiter) else start_after
+        s3_paginator = s3.get_paginator("list_objects_v2")
+        if settings._CACHE and settings._REFRESHCACHE:
+            for p in s3_paginator.paginate(Bucket=bucket_name, Prefix=prefix, StartAfter=start_after,
+                                           PaginationConfig={'PageSize': 1000}):
+                write_cache_csv(bucket_name, p.get('Contents'))
+        try:
+            if settings._LOWMEMORY:
+                # low memory
+                datas = pd.concat((pd.DataFrame(d.get("Contents"),
+                                                columns=['StorageClass', 'Size', 'LastModified']).groupby(
+                    ['StorageClass']).agg({'StorageClass': 'count', 'Size': 'sum', 'LastModified': 'max'}).rename(
+                    columns={'StorageClass': 'Count'}) for d in
+                    s3_paginator.paginate(Bucket=bucket_name, Prefix=prefix, StartAfter=start_after,
+                                          PaginationConfig={'PageSize': 1000}))).groupby(
+                    'StorageClass').agg({'Count': 'sum', 'Size': 'sum', 'LastModified': 'max'})
+                aggs = (
+                    datas.groupby(['StorageClass']).agg({'Count': 'sum', 'Size': 'sum', 'LastModified': 'max'}).rename(
+                        columns={'StorageClass': 'Count'}).reset_index())
+            else:
+                # high memory
+                datas = pd.concat(
+                    pd.DataFrame(d.get("Contents"), columns=['StorageClass', 'Size', 'LastModified']) for d in
+                    s3_paginator.paginate(Bucket=bucket_name, Prefix=prefix, StartAfter=start_after,
+                                          PaginationConfig={'PageSize': 1000}))
+                aggs = (datas.groupby(['StorageClass']).agg(
+                    {'StorageClass': 'count', 'Size': 'sum', 'LastModified': 'max'}).rename(
+                    columns={'StorageClass': 'Count'}).reset_index())
+
+        except Exception as e:
+            print(e)
+            return []
+
+    bucket_objects = aggs['Count'].sum()
+    bucket_size = aggs['Size'].sum()
+    if 'LastModified' in aggs:
+        bucket_last = aggs['LastModified'].max()
+    else:
+        bucket_last = aggs['LastModifiedDate'].max()
+
+    bucket_cost = 0.0
+    bucket = boto3.resource("s3").Bucket(bucket_name)
+    bucket_region = get_region(bucket_name)
+    content = aggs.to_dict('rows')
+    for storageClass in content:
+        cost = get_bucket_cost_for_storageclass(bucket_region, storageClass['StorageClass'], storageClass['Size'])
+        if cost > 0:
+            storageClass['Cost'] = "${:,.2f}".format(cost)
+            bucket_cost += cost
+
+    if bucket_cost > 0:
+        bucket_cost_str = "${:,.2f}".format(bucket_cost)
+    else:
+        bucket_cost_str = "n/a"
+    bucket_stats = [
+        {
+            'Name': bucket_name,
+            'CreationDate': str(bucket.creation_date),
+            'LastModified': str(bucket_last),
+            'Versioning': get_versioning(bucket_name),
+            'WebSite': get_website(bucket_name),
+            'Analytics': get_analytics(bucket_name),
+            'Acceleration': get_acceleration(bucket_name),
+            'Replication': get_replication(bucket_name),
+            'Policy': get_policy(bucket_name),
+            'ObjectLock': get_object_lock_configuration(bucket_name),
+            'Inventory': get_inventory_configurations(bucket_name),
+            'Region': bucket_region,
+            'LocationConstraint': get_location(bucket_name),
+            'Grantee': get_grantees(bucket_name),
+            'Encryption': get_encryption(bucket_name),
+            'Size': display_size(bucket_size),
+            'Count': bucket_objects,
+            'Cost': bucket_cost_str,
+            'Content': content
+        }
+    ]
+
+    global grand_total_cost
+    global grand_total_size
+    global grand_total_objects
+    grand_total_cost += round(bucket_cost, 2)
+    grand_total_objects += bucket_objects
+    grand_total_size += bucket_size
+
+    bucket_processing_time = timedelta(milliseconds=round(1000 * (time.perf_counter() - processing_start)))
+
+    #    if settings._THREADED:
+    #        return bucket_stats, bucket_processing_time
+    #    else:
+    #        yield bucket_stats, bucket_processing_time
+    result[i] = bucket_stats, bucket_processing_time
+
+    print(
+        "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(bucket_stats[0].get('Name'),
+                                                           bucket_stats[0]['CreationDate'],
+                                                           bucket_stats[0]['Count'],
+                                                           bucket_stats[0]['Size'], bucket_stats[0]['LastModified'],
+                                                           bucket_stats[0]['Cost'],
+                                                           str(bucket_processing_time)),
+        file=sys.stderr)
+
+    #result[i] = analyse_bucket_contents(bucket_name)
+
+def analyse_bucket_contents(bucket_name):
+    processing_start = time.perf_counter()
+
+    prefix= settings._KEY_PREFIX
+    delimiter="/"
+    start_after=""
     aggs = []
     if settings._CACHE and os.path.isfile(bucket_name + ".cache"):
         print("Processing via local Cache for bucket {}".format(bucket_name), end="\r")
@@ -512,7 +647,9 @@ def analyse_bucket_contents(bucket_name, prefix="/", delimiter="/", start_after=
     grand_total_objects += bucket_objects
     grand_total_size += bucket_size
 
-    yield bucket_stats
+    bucket_processing_time = timedelta(milliseconds=round(1000 * (time.perf_counter() - processing_start)))
+
+    yield bucket_stats, bucket_processing_time
 
 
 def load_aws_pricing(region, vol):
@@ -619,6 +756,7 @@ if __name__ == "__main__":
     add_bool_arg(parser, "inventory", True, "Use Inventory if exist")
     add_bool_arg(parser, "s3select", True, "Use S3 Select to parse inventory result files")
     add_bool_arg(parser, "lowmemory", False, "If you have low memory.")
+    add_bool_arg(parser, "threaded", True, "Use Multi-Thread.")
 
     settings = Settings()
     arguments = parser.parse_args()
@@ -639,6 +777,7 @@ if __name__ == "__main__":
     settings.set_inventory(arguments.inventory)
     settings.set_s3select(arguments.s3select)
     settings.set_lowmemory(arguments.lowmemory)
+    settings.set_threaded(arguments.threaded)
 
     settings.set_display_size( sizes_name.index(arguments.size))
     try:
@@ -667,42 +806,62 @@ if __name__ == "__main__":
                                                              "Cost (USD)", "Processing Time"), file=sys.stderr)
     buckets = []
 
-    for bucket_name in bucket_list:
+    if settings._THREADED:
+        buckets_results = [{} for i in bucket_list]
+        threads = []
 
-        if settings._REFRESHCACHE and os.path.isfile(bucket_name + ".cache"):
-            os.remove(bucket_name + ".cache")
-            if settings._VERBOSE > 1:
-                print("Bucket {} cache removed!".format(bucket_name))
-
-        print("{0:60}".format(bucket_name), file=sys.stderr, end="\r")
-        buckets.append(bucket_name)
-
-        bucket_creation = boto3.resource("s3").Bucket(bucket_name).creation_date
-        start = time.perf_counter()
-        for object in analyse_bucket_contents(bucket_name, settings._KEY_PREFIX):
-            print(
-                "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
-                                                             object[0]['Size'], object[0]['LastModified'],
-                                                             object[0]['Cost']), file=sys.stderr,
-                end="\r")
+        for i in range(len(bucket_list)):
+            process = Thread(target=threaded_analyse_bucket_contents, args=[bucket_list[i], buckets_results, i])
+            process.start()
+            threads.append(process)
+        for process in threads:
+            process.join()
+        print(buckets_results)
+        for bucket in buckets_results:
+            object = bucket[0]
             buckets_stats_array.extend(object)
-            print(
-                "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(bucket_name, object[0]['CreationDate'],
-                                                                   object[0]['Count'],
-                                                                   object[0]['Size'], object[0]['LastModified'],
-                                                                   object[0]["Cost"],
-                                                                   str(timedelta(milliseconds=round(
-                                                                       1000 * (time.perf_counter() - start))))),
-                file=sys.stderr)
-            if settings._VERBOSE > 1:
-                print(object)
+
+    else:
+        for bucket_name in bucket_list:
+
+            if settings._REFRESHCACHE and os.path.isfile(bucket_name + ".cache"):
+                os.remove(bucket_name + ".cache")
+                if settings._VERBOSE > 1:
+                    print("Bucket {} cache removed!".format(bucket_name))
+
+            print("{0:60}".format(bucket_name), file=sys.stderr, end="\r")
+            buckets.append(bucket_name)
+
+            bucket_creation = boto3.resource("s3").Bucket(bucket_name).creation_date
             start = time.perf_counter()
+            for bucket in analyse_bucket_contents(bucket_name):
+                object = bucket[0]
+                timing = bucket[1]
+                print(
+                    "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}".format(bucket_name, object[0]['CreationDate'], object[0]['Count'],
+                                                                 object[0]['Size'], object[0]['LastModified'],
+                                                                 object[0]['Cost']), file=sys.stderr,
+                    end="\r")
+                buckets_stats_array.extend(object)
+                print(
+                    "{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format(bucket_name, object[0]['CreationDate'],
+                                                                       object[0]['Count'],
+                                                                       object[0]['Size'], object[0]['LastModified'],
+                                                                       object[0]["Cost"],
+                                                                       str(timing)
+                                                                       #str(timedelta(milliseconds=round(1000 * (time.perf_counter() - start))))
+                                                                       ),
+                    file=sys.stderr)
+                if settings._VERBOSE > 1:
+                    print(object)
+                start = time.perf_counter()
 
     all_buckets_stats = {'Buckets': buckets_stats_array}
     if settings._OUTPUT_FILE.__len__() > 0:
         append_output(str(all_buckets_stats))
     if settings._VERBOSE > 0:
         print(all_buckets_stats)
+
     print("Grand Total:\n"\
           "  Total Buckets:   {:>40}\n"\
           "  Total Objects:   {:>40}\n"\
