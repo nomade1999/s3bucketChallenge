@@ -812,8 +812,9 @@ if __name__ == "__main__":
         for process in threads:
             process.join()
         for bucket in buckets_results:
-            object = bucket[0]
-            buckets_stats_array.extend(object)
+            if len(bucket) > 0:
+                object = bucket[0]
+                buckets_stats_array.extend(object)
 
     else:
         for bucket_name in bucket_list:
