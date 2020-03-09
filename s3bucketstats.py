@@ -525,10 +525,6 @@ def threaded_analyse_bucket_contents(bucket_name, result, i):
 
     bucket_processing_time = timedelta(milliseconds=round(1000 * (time.perf_counter() - processing_start)))
 
-    #    if settings._THREADED:
-    #        return bucket_stats, bucket_processing_time
-    #    else:
-    #        yield bucket_stats, bucket_processing_time
     result[i] = bucket_stats, bucket_processing_time
 
     print(
@@ -540,7 +536,6 @@ def threaded_analyse_bucket_contents(bucket_name, result, i):
                                                            str(bucket_processing_time)),
         file=sys.stderr)
 
-    #result[i] = analyse_bucket_contents(bucket_name)
 
 def analyse_bucket_contents(bucket_name):
     processing_start = time.perf_counter()
@@ -816,7 +811,6 @@ if __name__ == "__main__":
             threads.append(process)
         for process in threads:
             process.join()
-        print(buckets_results)
         for bucket in buckets_results:
             object = bucket[0]
             buckets_stats_array.extend(object)
