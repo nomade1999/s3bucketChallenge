@@ -600,6 +600,9 @@ def get_priceDimensions_for_region_volume(region, volumeType):
 
 
 if __name__ == "__main__":
+    # set process start timer
+    realstart = time.perf_counter()
+
     parser = ArgumentParser()
     parser.add_argument("-v", dest="verbose", required=False, default=1, help="Verbose level, 0 for quiet.")
     parser.add_argument("-l", dest="bucket_list", required=False, default='.*',
@@ -610,8 +613,6 @@ if __name__ == "__main__":
     parser.add_argument("-o", dest="output", required=False, default=None, help="Output to File")
     parser.add_argument("--size", dest="size", type=str, required=False, default="GB",
                         help="Possible values:  [ B | KB | MB | GB | TB | PB | EB | ZB | YB ]")
-    #parser.add_argument("-ds", dest="display_size", type=int, required=False, default=0,
-    #                    help="Display size in 0:B, 1:KB, 2:MB, 3:GB, 4:TB, 5:PB, 6:EB, 7:ZB, 8:YB")
 
     add_bool_arg(parser, "cache", False, "Use Cache file if available")
     add_bool_arg(parser, "refresh", False, "Force Refresh Cache")
@@ -624,8 +625,6 @@ if __name__ == "__main__":
 
     if arguments.verbose:
         settings.set_verbose(int(arguments.verbose))
-    #if arguments.display_size:
-    #    settings.set_display_size(int(arguments.display_size))
     if arguments.bucket_list:
         settings.set_bucket_list_regex(arguments.bucket_list)
     if arguments.region_filter:
@@ -651,25 +650,24 @@ if __name__ == "__main__":
 
     buckets_stats_array = []
 
+    # Filter buckets based on bucket list regex parameter.
     bucket_list = [i['Name'] for i in buckets['Buckets'] if re.match(settings._BUCKET_LIST_REGEX, i['Name'])]
+    # If no bucket found we simply assume that the parameter is a targeted bucket name
     if bucket_list.__len__() == 0:
         bucket_list.append(settings._BUCKET_LIST_REGEX)
+
+    # Filter buckets based on requested region filter.
+    [bucket_list.remove(b) for b in bucket_list if  not re.match(settings._REGION_FILTER, get_region(b))]
 
     grand_total_size = 0
     grand_total_objects = 0
     grand_total_cost = 0
 
-    realstart = time.perf_counter()
     print("{:60}{:>30}{:>20}{:>20}{:>30}{:>20}{:>40}".format("Bucket", "Created", "Objects", "Size", "LastModified",
                                                              "Cost (USD)", "Processing Time"), file=sys.stderr)
+    buckets = []
 
     for bucket_name in bucket_list:
-        try:
-            if not re.match(settings._REGION_FILTER, get_region(bucket_name)):
-                continue
-        except Exception:
-            # Bucket does not exist
-            continue
 
         if settings._REFRESHCACHE and os.path.isfile(bucket_name + ".cache"):
             os.remove(bucket_name + ".cache")
@@ -677,6 +675,8 @@ if __name__ == "__main__":
                 print("Bucket {} cache removed!".format(bucket_name))
 
         print("{0:60}".format(bucket_name), file=sys.stderr, end="\r")
+        buckets.append(bucket_name)
+
         bucket_creation = boto3.resource("s3").Bucket(bucket_name).creation_date
         start = time.perf_counter()
         for object in analyse_bucket_contents(bucket_name, settings._KEY_PREFIX):
