@@ -151,6 +151,9 @@ To have access to the Bucket informations you will all need the following permis
 
 There are no installations required, just download the script and run. 
 
+If you decide to run inside docker you can build it with the provided Dockerfile
+I used: DOCKER_BUILDKIT=1 docker build -t coveo-challenge .
+
 ## Running examples
 
 Just setup your environement to connect to AWS and test it to make sure you have access to your S3 buckets.
@@ -200,9 +203,15 @@ Get statistics for all buckets which name start with "mybucket" , key prefix /Fo
 python3 s3bucketstats.py -l 'mybucket' -k '/Folder/SubFolder/log' -s 3
 ```
 
+If you want to run via docker you will need to mount your ~/.aws folder to the container in order to get credentials
+Here is what I use on my MacOS
 ```
-Give an example
+docker container run --mount type=bind,source=$(echo ~)/.aws,target=/root/.aws,readonly -it -e AWS_PROFILE=default -v /tmp:/output coveo-challenge -l '.*' -o /output/docker-run-output.json 
 ```
+This will mount my home .aws folder ~/.aws to the root user in the container.
+I then specify which profile to use
+In order to get the output file writen to the host I need to mount another filesystem, here I simply mount the host /tmp to the /output in the container.
+
 
 ## Built With
 
