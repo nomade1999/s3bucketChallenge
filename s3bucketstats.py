@@ -36,7 +36,7 @@ global grand_total_cost
 class Settings(object):
     def __init__(self):
         self._REGEX = ".*"
-        self._BUCKET_LIST_REGEX = '.*'
+        self._BUCKET_LIST_REGEX = None
         self._KEY_PREFIX = '/'
         self._DISPLAY_SIZE = 0
         self._REGION_FILTER = '.*'
@@ -48,6 +48,10 @@ class Settings(object):
         self._S3SELECT = None
         self._LOWMEMORY = False
         self._THREADED = False
+        self._BUCKETS = None
+
+    def set_buckets(self, value):
+        self._BUCKETS = value
 
     def set_threaded(self, value):
         self._THREADED = value
@@ -82,7 +86,7 @@ class Settings(object):
     def set_regex(self, regex):
         self._REGEX = regex
 
-    def set_bucket_list_regex(self, regex):
+    def set_bucket_regex(self, regex):
         self._BUCKET_LIST_REGEX = regex
 
     def set_key_prefix(self, regex):
@@ -392,10 +396,8 @@ def read_inventory_file(bucket_name, key, cols_names):
 
 def add_bool_arg(parser, name, default=False, description=""):
     group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument("-" + name, dest=name, action="store_true",
-                       help=description + (" (DEFAULT) " if default else ""))
-    group.add_argument("-no-" + name, dest=name, action="store_false",
-                       help="Do not " + description + (" (DEFAULT) " if not default else ""))
+    group.add_argument("-" + name, dest=name, action="store_true", help=description + (" (DEFAULT) " if default else ""))
+    group.add_argument("-no-" + name, dest=name, action="store_false", help="Do not " + description + (" (DEFAULT) " if not default else ""))
     parser.set_defaults(**{name: default})
 
 
@@ -468,7 +470,7 @@ def threaded_analyse_bucket_contents(bucket_name, result, i):
                     columns={'StorageClass': 'Count'}).reset_index())
 
         except Exception as e:
-            print(e)
+            if settings._VERBOSE > 1: print(e)
             return []
 
     bucket_objects = aggs['Count'].sum()
@@ -587,7 +589,7 @@ def analyse_bucket_contents(bucket_name):
                     columns={'StorageClass': 'Count'}).reset_index())
 
         except Exception as e:
-            print(e)
+            if settings._VERBOSE > 1: print(e)
             return []
 
     bucket_objects = aggs['Count'].sum()
@@ -731,20 +733,14 @@ def get_priceDimensions_for_region_volume(region, volumeType):
     return sorted(price_dimensions, key=lambda i: int(i['beginRange']))
 
 
-if __name__ == "__main__":
-    # set process start timer
-    realstart = time.perf_counter()
-
-    parser = ArgumentParser()
-    parser.add_argument("-v", dest="verbose", required=False, default=1, help="Verbose level, 0 for quiet.")
-    parser.add_argument("-l", dest="bucket_list", required=False, default='.*',
-                        help="Regex to filter which buckets to process.")
-    parser.add_argument("-k", dest="key_prefix", required=False, default='/',
-                        help="Key prefix to filter on, default='/'")
-    parser.add_argument("-r", dest="region_filter", required=False, default='.*', help="Regex Region filter")
-    parser.add_argument("-o", dest="output", required=False, default=None, help="Output to File")
-    parser.add_argument("--size", dest="size", type=str, required=False, default="GB",
-                        help="Possible values:  [ B | KB | MB | GB | TB | PB | EB | ZB | YB ]")
+def set_arguments_parameters(parser):
+    parser.add_argument("-v","--verbose", dest="verbose", required=False, default=1, help="Verbose level, 0 for quiet.")
+    parser.add_argument("-l", "--list-regex", dest="bucket_regex", required=False, default=None, help="Regex to filter which buckets to process. Use '.*' to scan all.")
+    parser.add_argument("-k", "--key-prefix", dest="key_prefix", required=False, default='/', help="Key prefix to filter on, default='/'")
+    parser.add_argument("-r", "--region-regex", dest="region_filter", required=False, default='.*', help="Regex Region filter")
+    parser.add_argument("-o", "--output", dest="output", required=False, default=None, help="Output to File")
+    parser.add_argument("-s", "--display-size", dest="size", type=str, required=False, default="GB", help="Possible values:  [ B | KB | MB | GB | TB | PB | EB | ZB | YB ]")
+    parser.add_argument("-b", "--buckets", dest="buckets", type=str, nargs='+', required=False, default="", help="List of specific buckets to scan. Multiple seperated by space")
 
     add_bool_arg(parser, "cache", False, "Use Cache file if available")
     add_bool_arg(parser, "refresh", False, "Force Refresh Cache")
@@ -753,19 +749,14 @@ if __name__ == "__main__":
     add_bool_arg(parser, "lowmemory", False, "If you have low memory.")
     add_bool_arg(parser, "threaded", True, "Use Multi-Thread.")
 
-    settings = Settings()
     arguments = parser.parse_args()
 
-    if arguments.verbose:
-        settings.set_verbose(int(arguments.verbose))
-    if arguments.bucket_list:
-        settings.set_bucket_list_regex(arguments.bucket_list)
-    if arguments.region_filter:
-        settings.set_region_filter(arguments.region_filter)
-    if arguments.key_prefix:
-        settings.set_key_prefix(arguments.key_prefix)
-    if arguments.output is not None:
-        settings.set_output_file(arguments.output)
+    if arguments.verbose: settings.set_verbose(int(arguments.verbose))
+    if arguments.buckets: settings.set_buckets(arguments.buckets)
+    if arguments.bucket_regex: settings.set_bucket_regex(arguments.bucket_regex)
+    if arguments.region_filter: settings.set_region_filter(arguments.region_filter)
+    if arguments.key_prefix: settings.set_key_prefix(arguments.key_prefix)
+    if arguments.output is not None: settings.set_output_file(arguments.output)
 
     settings.set_refresh_cache(arguments.refresh)
     settings.set_cache(arguments.cache)
@@ -774,7 +765,19 @@ if __name__ == "__main__":
     settings.set_lowmemory(arguments.lowmemory)
     settings.set_threaded(arguments.threaded)
 
-    settings.set_display_size( sizes_name.index(arguments.size))
+    settings.set_display_size(sizes_name.index(arguments.size))
+
+
+if __name__ == "__main__":
+    # set process start timer
+    realstart = time.perf_counter()
+
+    # Initialize settings with default values
+    settings = Settings()
+
+    parser = ArgumentParser()
+    set_arguments_parameters(parser)
+
     try:
         s3 = boto3.client('s3')
         buckets = s3.list_buckets()
@@ -783,15 +786,22 @@ if __name__ == "__main__":
        exit(1)
 
     buckets_stats_array = []
+    bucket_list = []
 
     # Filter buckets based on bucket list regex parameter.
-    bucket_list = [i['Name'] for i in buckets['Buckets'] if re.match(settings._BUCKET_LIST_REGEX, i['Name'])]
+    if settings._BUCKET_LIST_REGEX is not None:
+        bucket_list = [i['Name'] for i in buckets['Buckets'] if re.match(settings._BUCKET_LIST_REGEX, i['Name'])]
+
     # If no bucket found we simply assume that the parameter is a targeted bucket name
+    if settings._BUCKETS is not None:
+        bucket_list.extend(settings._BUCKETS)
+
     if bucket_list.__len__() == 0:
-        bucket_list.append(settings._BUCKET_LIST_REGEX)
+        print("No buckets to scan found. run with -h to see available options")
+        exit(0)
 
     # Filter buckets based on requested region filter.
-    [bucket_list.remove(b) for b in bucket_list if  not re.match(settings._REGION_FILTER, get_region(b))]
+    [bucket_list.remove(b) for b in bucket_list if not re.match(settings._REGION_FILTER, get_region(b))]
 
     grand_total_size = 0
     grand_total_objects = 0
